@@ -762,7 +762,19 @@ def polarization_fidelity(counts, correct_dist, thermal_dist=None):
     fidelity = rescale_fidelity(hf_fidelity, floor_fidelity, new_floor_fidelity)
 
     return { 'fidelity':fidelity, 'hf_fidelity':hf_fidelity }
+
+def accuracy_ratio_fidelity(expval: float, exact: float, minimum: float, maximum: float):
+    """ (Tentative) accuracy ratio
+
+        It uses a tentative modified version.
+
+        Accuracy ratio from: `https://arxiv.org/abs/2402.08985` (Eq. 8)
+    """
     
+    fidelity = 1.0 - np.abs(exact - expval) / (maximum - minimum)
+
+    return { 'fidelity': fidelity }
+
 
 ###############################################
 # METRICS UTILITY FUNCTIONS - FOR VISUALIZATION

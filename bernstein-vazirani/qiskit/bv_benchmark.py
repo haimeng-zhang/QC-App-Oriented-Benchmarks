@@ -107,7 +107,6 @@ def run (min_qubits=3, max_qubits=6, skip_qubits=1, max_circuits=3, num_shots=10
 
     # Define custom result handler
     def execution_handler (qc, result, num_qubits, s_int, num_shots):  
-     
         # determine fidelity of result set
         num_qubits = int(num_qubits)
         counts, fidelity = analyze_and_print_result(qc, result, num_qubits, int(s_int), num_shots)
