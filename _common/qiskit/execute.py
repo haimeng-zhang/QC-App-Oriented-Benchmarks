@@ -33,10 +33,9 @@ import logging
 import numpy as np
 
 from datetime import datetime, timedelta
-from qiskit import QuantumCircuit, transpile
+from qiskit import transpile
 from qiskit.providers.jobstatus import JobStatus
-from qiskit.primitives import StatevectorSampler
-from qiskit_aer import Aer
+from qiskit_aer import Aer, AerSimulator
 
 # Noise Model imports
 from qiskit_aer.noise import NoiseModel, ReadoutError
@@ -301,6 +300,30 @@ def set_execution_target(backend_id='qasm_simulator',
         from qiskit.primitives import StatevectorSampler
         sampler = StatevectorSampler()
 
+    # special handling for ibmq_qasm_simulator to set noise model
+    # Note: It works as the local testing mode with a noise model.
+    # It used to be a remote simulator, which was sunset in May 2024.
+    # https://docs.quantum.ibm.com/announcements/product-updates/2024-05-15-2024-sunset-final-lab-simulators
+    if backend_id == "ibmq_qasm_simulator":
+        this_noise = noise
+        # get noise model from options; used only in simulator for now
+        if "noise_model" in exec_options:
+            this_noise = exec_options.get("noise_model", None)
+            if verbose:
+                print(f"... using custom noise model: {this_noise}")
+        # attach to backend if not None
+        if this_noise != None:
+            metrics.QV = this_noise.QV
+            if verbose:
+                print(f"... setting noise model, QV={this_noise.QV} on {backend_id}")
+
+        # set Sampler options
+        from qiskit_ibm_runtime import SamplerOptions, SamplerV2
+
+        options_dict = exec_options.get("sampler_options", None)
+        options = SamplerOptions(**options_dict if options_dict else {})
+        sampler = SamplerV2(AerSimulator(noise_model=this_noise), options=options)
+
     # handle 'fake' backends here
     elif 'fake' in backend_id:
         backend = getattr(
@@ -372,12 +395,7 @@ def set_execution_target(backend_id='qasm_simulator',
             # need to import `Session` here to avoid the collision with
             # `azure.quantum.job.session.Session`
             
-            from qiskit_ibm_runtime import (
-                QiskitRuntimeService,
-                SamplerOptions,
-                SamplerV2,
-                Session
-                )
+            from qiskit_ibm_runtime import QiskitRuntimeService, Session
             
             if not use_ibm_quantum_platform:
                 channel = "ibm_cloud"
