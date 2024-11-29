@@ -425,8 +425,10 @@ def run (min_qubits=3, max_circuits=1, max_qubits=18, num_shots=100, method = 1,
             qc = ShorsAlgorithm(number, base, method=method, verbose=verbose)
             metrics.store_metric(num_qubits, number_order, 'create_time', time.time()-ts)
 
-            # collapse the 4 sub-circuit levels used in this benchmark (for qiskit)
-            qc = qc.decompose().decompose().decompose().decompose()
+            # collapse the 1 sub-circuit levels used in this benchmark (for qiskit)
+            # cannot increase `reps` more than 1 until
+            # https://github.com/Qiskit/qiskit/issues/13493 is fixed
+            qc = qc.decompose(reps=1)
 
             # submit circuit for execution on target (simulator, cloud simulator, or hardware)
             ex.submit_circuit(qc, num_qubits, number_order, num_shots)
