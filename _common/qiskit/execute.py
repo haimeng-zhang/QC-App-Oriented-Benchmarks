@@ -1397,14 +1397,12 @@ def finalize_execution(completion_handler=metrics.finalize_group, report_end=Tru
     if report_end:
         metrics.end_metrics()
 
-
-def close_session():
-    # close any active session at end of the app
+    # also, close any active session at end of the app
     global session
-    if session is not None:
+    if report_end and session is not None:
         if verbose:
             print(f"... closing active session: {session_count}\n")
-        
+
         session.close()
         session = None
 
