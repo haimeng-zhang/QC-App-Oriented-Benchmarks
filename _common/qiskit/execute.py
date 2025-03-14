@@ -76,6 +76,11 @@ session_count = 0
 session = None
 sampler = None
 
+# M3 mitigation
+use_m3 = False
+m3_mitigation = {}
+m3_cache = {}
+
 # Use the IBM Quantum Platform system; default is to use the IBM Cloud
 use_ibm_quantum_platform = False
 
@@ -93,6 +98,10 @@ backend = Aer.get_backend("qasm_simulator")
 
 # Execution options, passed to transpile method
 backend_exec_options = None
+
+# Target
+target = None
+use_realtime_calibration = False
 
 # Create array of batched circuits and a dict of active circuits
 batched_circuits = []
@@ -146,15 +155,22 @@ class BenchmarkResult:
         super().__init__()
         self.qiskit_result = qiskit_result
         self.metadata = qiskit_result.metadata
+        self._counts = None
+
+    def set_counts(self, counts):
+        self._counts = counts
 
     def get_counts(self, qc=0):
         # TODO: need to refactor the caller of get_counts not to submit QuantumCircuit
         # and use index instead to be compatible with PrimitiveResult.
         # `qc` is intentionally ignored.
+        if self._counts:
+            return self._counts
         qc_index = 0 # this should point to the index of the circuit in a pub
-        bitvals = next(iter(self.qiskit_result[qc_index].data.values()))
-        counts = bitvals.get_counts()
-        return counts
+        # merge outcomes of all classical registers
+        bitvals = self.qiskit_result[qc_index].join_data()
+        self._counts = bitvals.get_counts()
+        return self._counts
 
 # Special Job object class to hold job information for custom executors
 class Job:
@@ -259,11 +275,19 @@ def set_execution_target(backend_id='qasm_simulator',
     global use_ibm_quantum_platform
     global use_sessions
     global session_count
+    global use_m3
+    global use_realtime_calibration
     authentication_error_msg = "No credentials for {0} backend found. Using the simulator instead."
 
     # default to qasm_simulator if None passed in
     if backend_id == None:
         backend_id="qasm_simulator"
+
+    if exec_options is None:
+        exec_options = {}
+
+    # set M3 options
+    use_m3 = exec_options.get("use_m3", False)
         
     # if a custom provider backend is given, use it ...
     # Note: in this case, the backend_id is an identifier that shows up in plots
@@ -297,10 +321,14 @@ def set_execution_target(backend_id='qasm_simulator',
     # handle Statevector simulator specially
     elif backend_id == 'statevector_simulator':
         backend = Aer.get_backend("statevector_simulator")
-    
+
     elif backend_id == "statevector_sampler":
         from qiskit.primitives import StatevectorSampler
         sampler = StatevectorSampler()
+
+    elif backend_id == "aer_sampler":
+        from qiskit_aer.primitives import SamplerV2 as AerSampler
+        sampler = AerSampler()
 
     # handle 'fake' backends here
     elif 'fake' in backend_id:
@@ -311,6 +339,8 @@ def set_execution_target(backend_id='qasm_simulator',
             backend_id.title().replace('_', '')
         )
         backend = backend()
+        from qiskit_aer.primitives import SamplerV2
+        sampler = SamplerV2.from_backend(backend)
         logger.info(f'Set {backend = }')   
 
     # otherwise use the given providername or backend_id to find the backend
@@ -405,7 +435,7 @@ def set_execution_target(backend_id='qasm_simulator',
 
             # DEVNOTE: here we assume if the sessions flag is set, we use Sampler
             # however, we may want to add a use_sampler option so that we can separate these
-            
+
             # set use_sessions if provided by user - NOTE: this will modify the global setting
             this_use_sessions = exec_options.get("use_sessions", None)
             if this_use_sessions != None:
@@ -423,6 +453,21 @@ def set_execution_target(backend_id='qasm_simulator',
                     print("... using batch")
                 if session is None:
                     session = Batch(backend=backend)
+            
+            # set real-time qubit selection options
+            use_realtime_calibration = exec_options.get("use_realtime_calibration", False)
+
+            global target
+            if use_realtime_calibration and target is None:
+                print("... calibrating target for qubit selection")
+                try:
+                    remove_bad_qubits = (use_realtime_calibration == 2)
+                    target = calibrate_target(
+                        backend, session, remove_bad_qubits=remove_bad_qubits
+                    )
+                except Exception as ex:
+                    print(traceback.format_exc())
+                    raise ex
 
             # set Sampler options
             options_dict = exec_options.get("sampler_options", None)
@@ -580,6 +625,7 @@ def execute_circuit(circuit):
         optimization_level = backend_exec_options_copy.pop("optimization_level", None)
         layout_method = backend_exec_options_copy.pop("layout_method", None)
         routing_method = backend_exec_options_copy.pop("routing_method", None)
+        approximation_degree = backend_exec_options_copy.pop("approximation_degree", 1.0)
         
         # option to transpile multiple times to find best one
         transpile_attempt_count = backend_exec_options_copy.pop("transpile_attempt_count", None)
@@ -665,21 +711,23 @@ def execute_circuit(circuit):
             
             #************************************************
             # Initiate execution for all other backends and noiseless simulator
-            else:            
-     
+            else:
                 # if set, transpile many times and pick shortest circuit
                 # DEVNOTE: this does not handle parameters yet, or optimizations
                 if transpile_attempt_count:
                     trans_qc = transpile_multiple_times(circuit["qc"], circuit["params"], backend,
-                            transpile_attempt_count, 
-                            optimization_level=None, layout_method=None, routing_method=None)
+                            target, transpile_attempt_count, 
+                            optimization_level=None, layout_method=None, routing_method=None,
+                            approximation_degree=approximation_degree)
                             
                 # transpile and bind circuit with parameters; use cache if flagged                       
                 else:
                     trans_qc = transpile_and_bind_circuit(circuit["qc"], circuit["params"], backend,
+                            target=target,
                             optimization_level=optimization_level,
                             layout_method=layout_method,
-                            routing_method=routing_method)
+                            routing_method=routing_method,
+                            approximation_degree=approximation_degree)
                 
                 # apply transformer pass if provided
                 if transformer:
@@ -697,17 +745,34 @@ def execute_circuit(circuit):
                 #*************************************
                 # perform circuit execution on backend
                 logger.info(f'Running trans_qc, shots={shots}')
-                st = time.time() 
+                st = time.time()
+                if use_m3:
+                    from mthree import M3Mitigation
+                    from mthree.utils import final_measurement_mapping
+                    mapping = final_measurement_mapping(trans_qc)
+                    qubits = tuple(mapping.values())
+                    sorted_qubits = tuple(sorted(set(qubits)))
+                    if sorted_qubits in m3_cache:
+                        mit = m3_cache[sorted_qubits]
+                        logger.info(f"Use cached M3 {sorted_qubits=}")
+                    else:
+                        mit = M3Mitigation(backend)
+                        mit.cals_from_system(sorted_qubits, runtime_mode=session)
+                        m3_cache[sorted_qubits] = mit
+                        logger.info(f"Calibrating M3 {sorted_qubits=}")
 
                 if sampler:
                     # set job tags if SamplerV2 on IBM Quantum Platform
-                    if hasattr(sampler, "options"):
+                    if hasattr(sampler, "options") and hasattr(sampler.options, "environment"):
                         sampler.options.environment.job_tags = job_tags
 
                     # turn input into pub-like
                     job = sampler.run([trans_qc], shots=shots)
                 else:
                     job = backend.run(trans_qc, shots=shots, **backend_exec_options_copy)
+
+                if use_m3:
+                    m3_mitigation[job] = (mit, qubits)
 
                 logger.info(f'Finished Running trans_qc - {round(time.time() - st, 5)} (ms)')
                 if verbose_time: print(f"  *** qiskit.run() time = {round(time.time() - st, 5)}")
@@ -767,7 +832,6 @@ def wait_on_job_result(job, active_circuit):
             retry_count += 1
             result = job.result()
             break
-                         
         except Exception:
             print(f'... error occurred during job.result() for circuit {active_circuit["group"]} {active_circuit["circuit"]} -- retry {retry_count}')
             if verbose: print(traceback.format_exc())
@@ -847,12 +911,12 @@ def transpile_for_metrics(qc):
     # use either the backend or one of the basis gate sets
     if basis_selector == 0:
         logger.info(f"Start transpile with {basis_selector = }")
-        qc = transpile(qc, backend, seed_transpiler=0)
+        qc = transpile(qc, backend, target=target, seed_transpiler=0)
         logger.info(f"End transpile with {basis_selector = }")
     else:
         basis_gates = basis_gates_array[basis_selector]
         logger.info("Start transpile with basis_selector != 0")
-        qc = transpile(qc, basis_gates=basis_gates, seed_transpiler=0)
+        qc = transpile(qc, target=target, basis_gates=basis_gates, seed_transpiler=0)
         logger.info("End transpile with basis_selector != 0")
     
     #print(qc)
@@ -884,19 +948,26 @@ def transpile_for_metrics(qc):
 # Cache the transpiled circuit, and use it if do_transpile_for_execute not set
 # DEVNOTE: this approach does not permit passing of untranspiled circuit through
 # DEVNOTE: currently this only caches a single circuit
-def transpile_and_bind_circuit(circuit, params, backend, basis_gates=None,
+def transpile_and_bind_circuit(circuit, params, backend, target=None, basis_gates=None,
                 optimization_level=None, layout_method=None, routing_method=None,
-                seed_transpiler=None):
+                approximation_degree=1.0, seed_transpiler=0):
                 
     logger.info('transpile_and_bind_circuit()')
     st = time.time()
         
     if do_transpile_for_execute:
         logger.info('transpiling for execute')
-        trans_qc = transpile(circuit, backend, basis_gates=basis_gates,
+        trans_qc = transpile(circuit, backend=backend, target=target, basis_gates=basis_gates,
                 optimization_level=optimization_level, layout_method=layout_method, routing_method=routing_method,
-                seed_transpiler=seed_transpiler)
-        
+                approximation_degree=approximation_degree, seed_transpiler=seed_transpiler)
+        no_approx = transpile(circuit, backend=backend, target=target, basis_gates=basis_gates,
+                optimization_level=optimization_level, layout_method=layout_method, routing_method=routing_method,
+                approximation_degree=1.0, seed_transpiler=seed_transpiler)
+        if approximation_degree < 1.0:
+            print(f"  ... approximation degree {approximation_degree}:\n"
+                f"      (approx=1) {no_approx.count_ops()}\n"
+                f"      -> (approx={approximation_degree}) {trans_qc.count_ops()}")
+
         # cache this transpiled circuit
         cached_circuits["last_circuit"] = trans_qc
     
@@ -936,8 +1007,9 @@ def transpile_and_bind_circuit(circuit, params, backend, basis_gates=None,
 
 # Transpile a circuit multiple times for optimal results
 # DEVNOTE: this does not handle parameters yet
-def transpile_multiple_times(circuit, params, backend, transpile_attempt_count, 
-                optimization_level=None, layout_method=None, routing_method=None):
+def transpile_multiple_times(circuit, params, backend, target, transpile_attempt_count, 
+                optimization_level=None, layout_method=None, routing_method=None,
+                approximation_degree=None):
     
     logger.info(f"transpile_multiple_times({transpile_attempt_count})")
     st = time.time()
@@ -946,10 +1018,12 @@ def transpile_multiple_times(circuit, params, backend, transpile_attempt_count,
     trans_qc_list = [
         transpile(
             circuit, 
-            backend, 
+            backend,
+            target=target,
             optimization_level=optimization_level,
             layout_method=layout_method,
             routing_method=routing_method,
+            approximation_degree=approximation_degree,
             seed_transpiler=seed,
         ) for seed in range(transpile_attempt_count)
     ]
@@ -1156,13 +1230,16 @@ def job_complete(job):
         # <result> contains results from multiple circuits
         # DEVNOTE: This will need to change; currently the only case where we have multiple result counts
         # is when using randomly_compile; later, there will be other cases
-        if not use_sessions and type(result.get_counts()) == list:
+        result_counts = result.get_counts()
+        if isinstance(result_counts, list):
             total_counts = dict()
-            for count in result.get_counts():
+            for count in result_counts:
+                if job in m3_mitigation:
+                    mit, qubits = m3_mitigation[job]
+                    count = mit.apply_correction(count, qubits).nearest_probability_distribution()
                 total_counts = dict(Counter(total_counts) + Counter(count))
                 
             # make a copy of the result object so we can return a modified version
-            orig_result = result
             result = copy.copy(result) 
 
             # replace the results array with an array containing only the first results object
@@ -1172,6 +1249,11 @@ def job_complete(job):
             results.shots = actual_shots
             results.data.counts = total_counts
             result.results = [ results ]
+        else:
+            if job in m3_mitigation:
+                mit, qubits = m3_mitigation[job]
+                count = mit.apply_correction(result_counts, qubits).nearest_probability_distribution()
+                result.set_counts(count)
             
         try:
             result_handler(active_circuit["qc"],
@@ -1366,7 +1448,6 @@ def throttle_execution(completion_handler=metrics.finalize_group):
 # This is used as a way to complete all groups of circuits and report results.
 
 def finalize_execution(completion_handler=metrics.finalize_group, report_end=True):
-
     #if verbose:
         #print("... finalize_execution")
 
@@ -1461,6 +1542,14 @@ def check_jobs(completion_handler=None):
             print("... circuit execution failed.")
             if hasattr(job, "error_message"):
                 print(f"    job = {job.job_id()}  {job.error_message()}")
+            else:
+                try:
+                    _ = job.result()
+                except Exception as ex:
+                    print(f"    job = {job.job_id()}  '{ex.message}'")
+                    if verbose:
+                        print(traceback.format_exc())
+
 
         if status == JobStatus.DONE or status == JobStatus.CANCELLED or status == JobStatus.ERROR or status == 'DONE' or status =='CANCELLED' or status == 'ERROR':
             #if verbose: print("Job status is ", job.status() )
@@ -1603,4 +1692,145 @@ def job_wait_for_completion(job):
         print("\n... circuit execution failed.")
 
 
+def calibrate_target(backend, session, remove_bad_qubits: bool = False):
+    """
+    Calibrate the target properties of a quantum backend.
 
+    Parameters:
+    backend (qiskit.providers.BackendV2): The quantum backend to calibrate.
+    session (qiskit_ibm_runtime.Session): The IBM Quantum Runtime session.
+
+    Returns:
+    qiskit.transpiler.Target: The calibrated target properties of the backend.
+    """
+    import rustworkx
+    from collections import defaultdict
+    from qiskit.transpiler import InstructionProperties, CouplingMap, Target
+    from qiskit_experiments.library import T1, T2Hahn, LocalReadoutError, StandardRB
+    from qiskit_experiments.framework import BatchExperiment, ParallelExperiment
+    from qiskit_ibm_runtime import SamplerV2
+
+    qubits = list(range(backend.num_qubits))
+    coupling_graph = backend.coupling_map.graph.to_undirected(multigraph=False)
+
+    # Get layered coupling map
+    edge_coloring = rustworkx.graph_bipartite_edge_color(coupling_graph)
+    layered_coupling_map = defaultdict(list)
+    for edge_idx, color in edge_coloring.items():
+        layered_coupling_map[color].append(coupling_graph.get_edge_endpoints_by_index(edge_idx))
+    layered_coupling_map = [sorted(layered_coupling_map[i]) for i in sorted(layered_coupling_map.keys())]
+
+    flattened_layered_coupling_map = []
+    for layer in layered_coupling_map:
+        flattened_layered_coupling_map += layer
+
+    t1_exp = ParallelExperiment([T1(physical_qubits=[qubit], delays=np.linspace(1e-6, 2*backend.properties().t1(qubit), 5, endpoint=True)) for qubit in qubits], backend, analysis=None)
+    t2_exp = ParallelExperiment([T2Hahn(physical_qubits=[qubit], delays=np.linspace(1e-6, 2*backend.properties().t2(qubit), 5, endpoint=True)) for qubit in qubits], backend, analysis=None)
+    readout_exp = LocalReadoutError(qubits)
+    singleq_rb_exp = ParallelExperiment([StandardRB(physical_qubits=[qubit], lengths=[10, 100, 500], num_samples=10) for qubit in qubits], backend, analysis=None)
+    twoq_rb_exp_batched = BatchExperiment([ParallelExperiment([StandardRB(physical_qubits=pair, lengths=[10, 50, 100], num_samples=10) for pair in layer], backend, analysis=None) for layer in layered_coupling_map], backend, flatten_results=True, analysis=None)
+    batches = [t1_exp, t2_exp, readout_exp, singleq_rb_exp, twoq_rb_exp_batched]
+    batches_exp = BatchExperiment(batches, backend)
+    run_options = {'shots': 1000, 'dynamic': False}
+
+    # intentionally use backend to avoid timeout to generate large jobs for calibration
+    options = {"experimental": {"execution_path": "gen3-turbo"}}
+    sampler = SamplerV2(session, options=options)
+    sampler.options.environment.job_tags = ["realtime qubit selection"]
+
+    # Run characterization experiments
+    # Note: Disable parallel temporarily to avoid huge overhead on Linux
+    # Should use `should_run_in_parallel.override` for Qiskit 2.0 or newer
+    os.environ["QISKIT_IN_PARALLEL"] = "TRUE"
+    batches_exp_data = batches_exp.run(sampler=sampler, **run_options).block_for_results()
+    os.environ["QISKIT_IN_PARALLEL"] = "FALSE"
+
+    EPG_sx_result_list = batches_exp_data.analysis_results('EPG_sx')
+    EPG_sx_result_q_indices = [result.device_components.index for result in EPG_sx_result_list ]
+    EPG_x_result_list = batches_exp_data.analysis_results('EPG_x')
+    EPG_x_result_q_indices = [result.device_components.index for result in EPG_x_result_list ]
+    T1_result_list =  batches_exp_data.analysis_results('T1')
+    T1_result_q_indices = [result.device_components.index for result in T1_result_list ]
+    T2_result_list = batches_exp_data.analysis_results('T2')
+    T2_result_q_indices = [result.device_components.index for result in T2_result_list ]
+    Readout_result_list = batches_exp_data.analysis_results('Local Readout Mitigator')
+    if 'ecr' in backend.operation_names:
+        instruction_2q = 'ecr'
+    elif 'cz' in backend.operation_names:
+        instruction_2q = 'cz'
+    else:
+        raise RuntimeError('Only ecr and cz are supported 2q instructions')
+    EPG_2q_result_list = batches_exp_data.analysis_results(f'EPG_{instruction_2q}')
+
+    # Update target properties
+    target = copy.deepcopy(backend.target)
+    for i in range(target.num_qubits-1):
+        qarg = (i,)
+
+        if qarg in EPG_sx_result_q_indices:
+            target.update_instruction_properties(instruction='sx', qargs=qarg, properties=InstructionProperties(error=EPG_sx_result_list[i].value.nominal_value))
+        if qarg in EPG_x_result_q_indices:
+            target.update_instruction_properties(instruction='x', qargs=qarg, properties=InstructionProperties(error=EPG_x_result_list[i].value.nominal_value))
+
+        err_mat = Readout_result_list.value.assignment_matrix(i)
+        readout_assignment_error = (err_mat[0, 1] + err_mat[1, 0]) / 2  # average readout error
+        target.update_instruction_properties(instruction='measure', qargs=qarg, properties=InstructionProperties(error=readout_assignment_error))
+
+        if qarg in T1_result_q_indices:
+            target.qubit_properties[i].t1 = T1_result_list[i].value.nominal_value
+        if qarg in T2_result_q_indices:
+            target.qubit_properties[i].t2 = T2_result_list[i].value.nominal_value
+
+    for pair_idx, pair in enumerate(flattened_layered_coupling_map):
+        qarg = tuple(pair)
+        try:
+            target.update_instruction_properties(instruction=instruction_2q, qargs=qarg, properties=InstructionProperties(error=EPG_2q_result_list[pair_idx].value.nominal_value))
+        except Exception:
+            target.update_instruction_properties(instruction=instruction_2q, qargs=qarg[::-1], properties=InstructionProperties(error=EPG_2q_result_list[pair_idx].value.nominal_value))
+
+    if not remove_bad_qubits:
+        return target
+
+    # Remove bad qubits (`remove_bad_qubits == True`)
+    cmap = target.build_coupling_map(filter_idle_qubits=True)
+    cmap_list = list(cmap.get_edges())
+
+    max_meas_err = 0.06
+    min_t2 = 20
+    max_twoq_err = 0.02
+
+    # Remove qubits with bad measurement or t2
+    cust_cmap_list = copy.deepcopy(cmap_list)
+    for q in range(target.num_qubits):
+        meas_err = target['measure'][(q,)].error
+        t2 = target.qubit_properties[q].t2 * 1e6
+        if meas_err > max_meas_err or t2 < min_t2:
+            if meas_err > max_meas_err:
+                print(f"  ... Removing qubit {q} due to bad measurement error ({meas_err})")
+            if t2 < min_t2:
+                print(f"  ... Removing qubit {q} due to bad T2 ({t2})")
+            for q_pair in cmap_list:
+                if q in q_pair:
+                    try:
+                        cust_cmap_list.remove(q_pair)
+                    except Exception:
+                        continue
+
+    # Remove qubits with bad cz or t2
+    for q in cmap_list:
+        twoq_gate_err = target[instruction_2q][q].error
+        if twoq_gate_err > max_twoq_err:
+            print(f"  ... Removing qubits {q} due to bad 2Q gate error ({twoq_gate_err})")
+            for q_pair in cmap_list:
+                if q == q_pair:
+                    try:
+                        cust_cmap_list.remove(q_pair)
+                    except Exception:
+                        continue
+
+    custom_cmap = CouplingMap(cust_cmap_list)
+    custom_target = Target.from_configuration(
+        basis_gates = backend.configuration().basis_gates + ['measure'], # or whatever new set of gates
+        coupling_map = custom_cmap,
+    )
+    return custom_target
